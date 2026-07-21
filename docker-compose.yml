@@ -1,0 +1,34 @@
+services:
+  signal-cli-rest-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: signal-cli-rest-api
+    restart: unless-stopped
+    environment:
+      - MODE=json-rpc            # persistent daemon; best for a long-running sender
+    volumes:
+      - ./signal-cli-config:/home/.local/share/signal-cli
+    ports:
+      # Bound to localhost only. You need this reachable for the one-time linking /
+      # group-id lookup. Remove after setup if you prefer, or keep for maintenance.
+      - "127.0.0.1:8080:8080"
+
+  wa-signal-relay:
+    build: ./relay
+    container_name: wa-signal-relay
+    restart: unless-stopped
+    depends_on:
+      - signal-cli-rest-api
+    stdin_open: true            # keeps a TTY so the WhatsApp pairing QR renders in logs
+    tty: true
+    environment:
+      - SIGNAL_API_URL=http://signal-cli-rest-api:8080
+      - SIGNAL_NUMBER=${SIGNAL_NUMBER}
+      - SIGNAL_GROUP_ID=${SIGNAL_GROUP_ID}
+      - WA_GROUPS=${WA_GROUPS}
+      - SHOW_GROUP_LABEL=${SHOW_GROUP_LABEL:-true}
+      - RELAY_FROM_ME=${RELAY_FROM_ME:-true}
+      - WA_SELF_NAME=${WA_SELF_NAME:-Me}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - AUTH_DIR=/app/auth
+    volumes:
+      - ./relay-auth:/app/auth  # persists the WhatsApp link so you don't re-pair on restart

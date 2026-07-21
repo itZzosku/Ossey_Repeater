@@ -1,0 +1,9 @@
+# Secrets and runtime session state — never commit these
+.env
+relay-auth/
+signal-cli-config/
+
+# Node build artifacts (built inside Docker)
+relay/node_modules/
+relay/auth/
+npm-debug.log

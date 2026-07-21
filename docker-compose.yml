@@ -30,5 +30,7 @@ services:
       - WA_SELF_NAME=${WA_SELF_NAME:-Me}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - AUTH_DIR=/app/auth
+      - UPTIME_KUMA_PUSH_URL=${UPTIME_KUMA_PUSH_URL}
+      - UPTIME_KUMA_PUSH_INTERVAL=${UPTIME_KUMA_PUSH_INTERVAL:-60}
     volumes:
       - ./relay-auth:/app/auth  # persists the WhatsApp link so you don't re-pair on restart

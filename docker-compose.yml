@@ -10,7 +10,7 @@ services:
     ports:
       # Bound to localhost only. You need this reachable for the one-time linking /
       # group-id lookup. Remove after setup if you prefer, or keep for maintenance.
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8099:8080"
 
   wa-signal-relay:
     build: ./relay

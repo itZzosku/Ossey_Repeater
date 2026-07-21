@@ -5,6 +5,8 @@ import makeWASocket, {
 } from 'baileys'
 import qrcode from 'qrcode-terminal'
 import pino from 'pino'
+import fs from 'fs'
+import path from 'path'
 
 // ---------------------------------------------------------------------------
 // Config (all via environment variables)
@@ -36,10 +38,87 @@ const cfg = {
   selfName: process.env.WA_SELF_NAME || 'Me',             // name used for your own outgoing WA messages
   authDir: process.env.AUTH_DIR || './auth',
   logLevel: process.env.LOG_LEVEL || 'info',
+  uptimeKumaPushUrl: process.env.UPTIME_KUMA_PUSH_URL || '',
+  uptimeKumaIntervalSec: parseInt(process.env.UPTIME_KUMA_PUSH_INTERVAL || '60', 10),
+  // Reconnect catch-up: after an outage, backfill messages WhatsApp pushes on
+  // reconnect that we haven't already relayed.
+  catchupOnReconnect: (process.env.CATCHUP_ON_RECONNECT || 'true').toLowerCase() !== 'false',
+  catchupMaxHours: parseInt(process.env.CATCHUP_MAX_HOURS || '24', 10),   // ignore gaps older than this
+  catchupMaxCount: parseInt(process.env.CATCHUP_MAX_COUNT || '200', 10),  // safety cap per burst
 }
 
 const logger = pino({ level: cfg.logLevel })
 const subjectByJid = {}   // jid -> WhatsApp group name, learned at runtime
+let waConnected = false   // true only while the WhatsApp socket is open
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const nowSec = () => Math.floor(Date.now() / 1000)
+
+// ---------------------------------------------------------------------------
+// Dedup + high-water-mark state (persisted in the auth volume so it survives
+// restarts). relayedIds prevents double-sends; lastRelayedTs bounds catch-up.
+// ---------------------------------------------------------------------------
+const STATE_FILE = path.join(cfg.authDir, 'relay-state.json')
+const relayedIds = new Set()
+let lastRelayedTs = 0
+let saveTimer = null
+
+function loadState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
+    if (Array.isArray(s.relayedIds)) for (const id of s.relayedIds) relayedIds.add(id)
+    if (typeof s.lastRelayedTs === 'number') lastRelayedTs = s.lastRelayedTs
+  } catch { /* no state yet — first run */ }
+  // Baseline on first ever run: set the mark to "now" so the initial history
+  // dump on pairing is NOT relayed as a flood of old messages.
+  if (!lastRelayedTs) { lastRelayedTs = nowSec(); scheduleSave() }
+}
+
+function scheduleSave() {
+  if (saveTimer) return
+  saveTimer = setTimeout(() => {
+    saveTimer = null
+    try {
+      const ids = Array.from(relayedIds).slice(-5000) // keep the file bounded
+      fs.writeFileSync(STATE_FILE, JSON.stringify({ relayedIds: ids, lastRelayedTs }))
+    } catch (e) {
+      logger.warn(`Could not save relay state: ${e.message}`)
+    }
+  }, 1000)
+}
+
+function markRelayed(id, tsSec) {
+  if (id) relayedIds.add(id)
+  if (tsSec && tsSec > lastRelayedTs) lastRelayedTs = tsSec
+  if (relayedIds.size > 8000) { // trim in-memory set
+    const keep = Array.from(relayedIds).slice(-5000)
+    relayedIds.clear()
+    for (const k of keep) relayedIds.add(k)
+  }
+  scheduleSave()
+}
+
+function tsOf(m) {
+  const t = m?.messageTimestamp
+  if (t == null) return 0
+  if (typeof t === 'number') return t
+  if (typeof t.toNumber === 'function') return t.toNumber()
+  return Number(t) || 0
+}
+
+// ---------------------------------------------------------------------------
+// Uptime Kuma heartbeat — only while WhatsApp is actually connected.
+// ---------------------------------------------------------------------------
+async function pushHeartbeat() {
+  if (!cfg.uptimeKumaPushUrl || !waConnected) return
+  try {
+    const base = cfg.uptimeKumaPushUrl.split('?')[0]
+    const res = await fetch(`${base}?status=up&msg=${encodeURIComponent('WhatsApp connected')}`)
+    if (!res.ok) logger.warn(`Uptime Kuma push returned ${res.status}`)
+  } catch (e) {
+    logger.warn(`Uptime Kuma push failed: ${e.message}`)
+  }
+}
 
 function requireSignalConfig() {
   const missing = []
@@ -93,6 +172,41 @@ async function sendToSignal(text) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared relay path: used by both live messages and reconnect catch-up.
+// Returns true if a message was actually sent.
+// ---------------------------------------------------------------------------
+async function relayMessage(m, source) {
+  const jid = m.key?.remoteJid
+  if (!jid || !jid.endsWith('@g.us')) return false     // groups only
+  if (!cfg.groups.has(jid)) return false               // only configured groups
+  if (m.key.fromMe && !cfg.relayFromMe) return false
+
+  const id = m.key?.id
+  if (id && relayedIds.has(id)) return false           // dedup — already relayed
+
+  const text = extractText(m.message)
+  if (!text || !text.trim()) return false              // text-only: skip media/other
+
+  const sender = m.key.fromMe
+    ? cfg.selfName
+    : (m.pushName || (m.key.participant || '').split('@')[0] || 'Unknown')
+
+  const label = labelFor(jid)
+  const prefix = label ? `[${label}] ` : ''
+  const outgoing = `${prefix}${sender}: ${text}`
+
+  if (!requireSignalConfig()) {
+    logger.info(`[dry-run] ${outgoing}`)
+    return false
+  }
+
+  await sendToSignal(outgoing)
+  markRelayed(id, tsOf(m))
+  logger.info(`Relayed${source === 'catchup' ? ' (catch-up)' : ''} ${label ? `[${label}] ` : ''}from ${sender} (${text.length} chars)`)
+  return true
+}
+
+// ---------------------------------------------------------------------------
 // WhatsApp connection
 // ---------------------------------------------------------------------------
 async function start() {
@@ -128,6 +242,8 @@ async function start() {
     }
 
     if (connection === 'open') {
+      waConnected = true
+      pushHeartbeat() // report up immediately, don't wait for the interval
       logger.info('WhatsApp connection open.')
       if (!requireSignalConfig()) {
         logger.warn('Running in read-only debug mode until Signal config is provided.')
@@ -156,6 +272,7 @@ async function start() {
     }
 
     if (connection === 'close') {
+      waConnected = false
       const code = lastDisconnect?.error?.output?.statusCode
       const loggedOut = code === DisconnectReason.loggedOut
       logger.warn(`Connection closed (code=${code}). ${loggedOut ? 'Logged out — delete auth dir and re-pair.' : 'Reconnecting…'}`)
@@ -163,38 +280,61 @@ async function start() {
     }
   })
 
+  // Live messages (includes WhatsApp's offline queue drained on reconnect).
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return // only live messages, not history backfill
+    if (type !== 'notify') return // history backfill is handled separately below
     for (const m of messages) {
       try {
-        const jid = m.key?.remoteJid
-        if (!jid || !jid.endsWith('@g.us')) continue     // groups only
-        if (!cfg.groups.has(jid)) continue               // only configured groups
-        if (m.key.fromMe && !cfg.relayFromMe) continue
-
-        const text = extractText(m.message)
-        if (!text || !text.trim()) continue              // text-only: skip media/other
-
-        const sender = m.key.fromMe
-          ? cfg.selfName
-          : (m.pushName || (m.key.participant || '').split('@')[0] || 'Unknown')
-
-        const label = labelFor(jid)
-        const prefix = label ? `[${label}] ` : ''
-        const outgoing = `${prefix}${sender}: ${text}`
-
-        if (!requireSignalConfig()) {
-          logger.info(`[dry-run] ${outgoing}`)
-          continue
-        }
-
-        await sendToSignal(outgoing)
-        logger.info(`Relayed ${label ? `[${label}] ` : ''}from ${sender} (${text.length} chars)`)
+        await relayMessage(m, 'live')
       } catch (e) {
         logger.error(`Failed to relay a message: ${e.message}`)
       }
     }
   })
+
+  // Reconnect catch-up: WhatsApp pushes recent history on (re)connect. Backfill
+  // anything in our groups that we missed during an outage — bounded by age,
+  // count, and the dedup set so it can never re-send or flood old history.
+  sock.ev.on('messaging-history.set', async ({ messages }) => {
+    if (!cfg.catchupOnReconnect || !messages?.length) return
+    const cutoff = Math.max(lastRelayedTs, nowSec() - cfg.catchupMaxHours * 3600)
+
+    const candidates = messages
+      .filter((m) => {
+        const jid = m.key?.remoteJid
+        return jid && cfg.groups.has(jid) &&
+          !(m.key?.id && relayedIds.has(m.key.id)) &&
+          tsOf(m) > cutoff
+      })
+      .sort((a, b) => tsOf(a) - tsOf(b))
+      .slice(-cfg.catchupMaxCount)
+
+    if (!candidates.length) return
+    logger.info(`Catch-up: found ${candidates.length} missed message(s) to backfill.`)
+    let sent = 0
+    for (const m of candidates) {
+      try {
+        if (await relayMessage(m, 'catchup')) { sent++; await sleep(300) } // gentle pacing
+      } catch (e) {
+        logger.error(`Catch-up relay failed: ${e.message}`)
+      }
+    }
+    if (sent) logger.info(`Catch-up: backfilled ${sent} message(s).`)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+loadState()
+
+if (cfg.uptimeKumaPushUrl) {
+  logger.info(`Uptime Kuma heartbeat enabled (every ${cfg.uptimeKumaIntervalSec}s while WhatsApp is connected).`)
+  setInterval(pushHeartbeat, cfg.uptimeKumaIntervalSec * 1000)
+}
+
+if (cfg.catchupOnReconnect) {
+  logger.info(`Reconnect catch-up enabled (backfill gaps up to ${cfg.catchupMaxHours}h, max ${cfg.catchupMaxCount}/burst).`)
 }
 
 start().catch((e) => {

@@ -50,9 +50,20 @@ const cfg = {
 const logger = pino({ level: cfg.logLevel })
 const subjectByJid = {}   // jid -> WhatsApp group name, learned at runtime
 let waConnected = false   // true only while the WhatsApp socket is open
+let reconnectAttempts = 0 // for backoff + logging
+let kumaLastOk = null     // last Kuma push result, so we only log recoveries once
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const nowSec = () => Math.floor(Date.now() / 1000)
+
+// Map a DisconnectReason numeric code back to its name for readable logs.
+const REASON_NAMES = Object.fromEntries(Object.entries(DisconnectReason).map(([k, v]) => [v, k]))
+const reasonName = (code) => REASON_NAMES[code] || 'unknown'
+
+// Hide the push token when logging the Kuma URL.
+function maskToken(url) {
+  return url.replace(/(\/api\/push\/)([^/?]+)/, (_, p, tok) => p + (tok.length > 4 ? '…' + tok.slice(-4) : tok))
+}
 
 // ---------------------------------------------------------------------------
 // Dedup + high-water-mark state (persisted in the auth volume so it survives
@@ -111,12 +122,22 @@ function tsOf(m) {
 // ---------------------------------------------------------------------------
 async function pushHeartbeat() {
   if (!cfg.uptimeKumaPushUrl || !waConnected) return
+  const base = cfg.uptimeKumaPushUrl.split('?')[0]
   try {
-    const base = cfg.uptimeKumaPushUrl.split('?')[0]
     const res = await fetch(`${base}?status=up&msg=${encodeURIComponent('WhatsApp connected')}`)
-    if (!res.ok) logger.warn(`Uptime Kuma push returned ${res.status}`)
+    if (!res.ok) {
+      const body = (await res.text().catch(() => '')).slice(0, 200)
+      const hint = res.status === 404 ? '  [monitor paused/deleted, or wrong token?]' : ''
+      logger.warn(`Uptime Kuma push rejected: HTTP ${res.status} at ${maskToken(base)} — ${body || '(no body)'}${hint}`)
+      kumaLastOk = false
+    } else {
+      if (kumaLastOk === false) logger.info('Uptime Kuma push recovered — heartbeats flowing again.')
+      else logger.debug('Uptime Kuma heartbeat sent.')
+      kumaLastOk = true
+    }
   } catch (e) {
-    logger.warn(`Uptime Kuma push failed: ${e.message}`)
+    logger.warn(`Uptime Kuma push error at ${maskToken(base)}: ${e.message}`)
+    kumaLastOk = false
   }
 }
 
@@ -178,14 +199,15 @@ async function sendToSignal(text) {
 async function relayMessage(m, source) {
   const jid = m.key?.remoteJid
   if (!jid || !jid.endsWith('@g.us')) return false     // groups only
-  if (!cfg.groups.has(jid)) return false               // only configured groups
-  if (m.key.fromMe && !cfg.relayFromMe) return false
+  if (!cfg.groups.has(jid)) return false               // only configured groups (other groups skipped silently)
 
   const id = m.key?.id
-  if (id && relayedIds.has(id)) return false           // dedup — already relayed
+  const where = labelFor(jid) || jid
+  if (m.key.fromMe && !cfg.relayFromMe) { logger.debug(`skip own message in ${where} (RELAY_FROM_ME=false)`); return false }
+  if (id && relayedIds.has(id)) { logger.debug(`skip duplicate ${id} in ${where}`); return false }
 
   const text = extractText(m.message)
-  if (!text || !text.trim()) return false              // text-only: skip media/other
+  if (!text || !text.trim()) { logger.debug(`skip non-text message ${id} in ${where}`); return false }
 
   const sender = m.key.fromMe
     ? cfg.selfName
@@ -241,8 +263,14 @@ async function start() {
       qrcode.generate(qr, { small: true })
     }
 
+    if (connection === 'connecting') {
+      logger.debug('Connecting to WhatsApp…')
+    }
+
     if (connection === 'open') {
       waConnected = true
+      if (reconnectAttempts > 0) logger.info(`WhatsApp reconnected after ${reconnectAttempts} attempt(s).`)
+      reconnectAttempts = 0
       pushHeartbeat() // report up immediately, don't wait for the interval
       logger.info('WhatsApp connection open.')
       if (!requireSignalConfig()) {
@@ -274,15 +302,21 @@ async function start() {
     if (connection === 'close') {
       waConnected = false
       const code = lastDisconnect?.error?.output?.statusCode
-      const loggedOut = code === DisconnectReason.loggedOut
-      logger.warn(`Connection closed (code=${code}). ${loggedOut ? 'Logged out — delete auth dir and re-pair.' : 'Reconnecting…'}`)
-      if (!loggedOut) start().catch((e) => logger.error(e))
+      if (code === DisconnectReason.loggedOut) {
+        logger.error('Logged out by WhatsApp — delete the auth dir (relay-auth/) and re-pair. Not reconnecting.')
+        return
+      }
+      reconnectAttempts++
+      const delayMs = Math.min(30000, 2000 * reconnectAttempts) // backoff, capped at 30s
+      logger.warn(`WhatsApp disconnected (code=${code}, ${reasonName(code)}). Heartbeats paused. Reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttempts}).`)
+      setTimeout(() => start().catch((e) => logger.error(`Reconnect failed: ${e.message}`)), delayMs)
     }
   })
 
   // Live messages (includes WhatsApp's offline queue drained on reconnect).
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return // history backfill is handled separately below
+    logger.debug(`messages.upsert: ${messages.length} live message(s)`)
     for (const m of messages) {
       try {
         await relayMessage(m, 'live')
@@ -327,6 +361,12 @@ async function start() {
 // Boot
 // ---------------------------------------------------------------------------
 loadState()
+
+logger.info(
+  `Config: ${cfg.groups.size} group(s) → ${cfg.signalGroupId || '(no Signal group set)'} | ` +
+  `relayFromMe=${cfg.relayFromMe} | selfName="${cfg.selfName}" | ` +
+  `catchup=${cfg.catchupOnReconnect} | kuma=${cfg.uptimeKumaPushUrl ? 'on' : 'off'} | logLevel=${cfg.logLevel}`
+)
 
 if (cfg.uptimeKumaPushUrl) {
   logger.info(`Uptime Kuma heartbeat enabled (every ${cfg.uptimeKumaIntervalSec}s while WhatsApp is connected).`)
